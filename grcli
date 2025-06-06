@@ -1,0 +1,541 @@
+#!/usr/bin/python3
+
+import json
+import sys
+import hashlib 
+import copy
+import os
+import colorsys
+from datetime import date, datetime, timedelta
+from colors import color
+from tabulate import tabulate
+
+SUPPORTED_GRADING_SYSTEMS = [
+    "msg-sg-l1r5",
+    "msg-sg-avg-all",
+    "msg-sg-avg-l2r5",
+    "uasrp-sg-70rp",
+    "uasrp-sg-90rp"
+]
+
+def load_json():
+    file_path = os.path.expanduser("~/.grcli/data.json")
+    with open(file_path, "r") as f:
+        return json.load(f)
+
+def dump_json(data):
+    file_path = os.path.expanduser("~/.grcli/data.json")
+    try:
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=2)
+    except FileNotFoundError:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+data = load_json()
+
+def text_to_color(text):
+    raw = hashlib.sha256(text.encode()).hexdigest()[:6]
+    split = [raw[:2], raw[2:4], raw[4:]]
+    split = [int(i, 16) for i in split]
+    avg = sum(split)/3
+    while avg <= 128:
+        split = [min(255, 2 * i) for i in split]
+        avg = sum(split)/3
+    return "#" + "".join(hex(i)[2:].rjust(2, "0") for i in split)
+
+def verify_path(path): # verifies only if path is user accessible
+    keys = path.split('/')  # Split the path into keys
+    if any(k.startswith("_") for k in keys):
+        return False
+    if len(keys) < 2:
+        return True
+    if len(keys) == 3 and keys[1] in ["subjects", "seasons"]:
+        return True
+    if len(keys) == 5 and keys[1] == "seasons" and keys[3] == "tests":
+        return True
+    return False
+
+def get_value_from_path(data, path):
+    keys = path.split('/')  # Split the path into keys
+    current = data["grades"]  # Start at the root of the dictionary
+
+    if path == "":
+        return current
+
+    layer = 0
+    into_account = []
+    for key in keys[:-1]:  # Traverse all keys except the last one
+        into_account.append(key)
+        # Ensure the key exists and is a dictionary
+        if key not in current or not isinstance(current[key], dict):
+            return None 
+        if key:
+            current = current[key]  # Move deeper into the dictionary
+            layer += 1
+
+    return current[keys[-1]]
+
+def get_parent_from_path(path):
+    return "/".join(path.split("/")[:-1])
+
+def check_path_exists(data, path):
+    if path == "":
+        return True
+    key = path.split("/")[-1]
+    return key in get_value_from_path(data, get_parent_from_path(path)) or (data["grades"] == {} and not path)
+
+def set_value_by_path(data, path, value, delete=False):
+    keys = path.split("/")
+
+    parent_path = "/".join(keys[:-1])
+    key = keys[-1]
+
+    parent = get_value_from_path(data, parent_path)
+    if check_path_exists(data, parent_path):
+        if delete:
+            del parent[key]
+        else:
+            parent[key] = value
+
+def calculate_grade(grade, system, subject_type):
+    # parse type list
+    types = [t.strip().upper() for t in subject_type.split(",")]
+    
+    system_name_reduced = "-".join(system.split("-")[:2])
+    bounds = data["systems"][system_name_reduced]
+    bounds = [(i, bounds[i]["bound"]) for i in bounds]
+    index = 0
+    while index < len(bounds) and grade < bounds[index][1]:
+        index += 1
+    if index >= len(bounds):
+        index = len(bounds) - 1
+    final_grade = bounds[index][0]
+    points = data["systems"][system_name_reduced][final_grade]["points"]
+
+    if system.startswith("uasrp-sg") and "H2" in types:
+        points *= 2
+    return final_grade, points
+
+def calculate_grades(grades, season=None):
+    subjects = {
+        subject: {
+            "type": grades["subjects"][subject]["type"],
+            "score": 0,
+            "full": 0
+        }
+        for subject in grades["subjects"]
+    }
+
+    if season:
+        seasons_to_process = {season: grades["seasons"][season]}
+    else:
+        seasons_to_process = grades["seasons"]
+
+    for season_obj in seasons_to_process.values():
+        for test in season_obj["tests"]:
+            test_obj = season_obj["tests"][test]
+            test_subj = test_obj["subject"]
+            subjects[test_subj]["score"] += test_obj["score"] / test_obj["full"] * 100 * test_obj["weightage"]
+            subjects[test_subj]["full"] += test_obj["weightage"]
+
+    for subject in subjects:
+        subjects[subject]["score"] = round(subjects[subject]["score"]/subjects[subject]["full"])
+        del subjects[subject]["full"]
+
+    return subjects
+
+def find_best_scores(grades, types):
+    """
+    grades: dict[str, dict] with keys:
+        "type": str (comma-separated types, e.g. "H1,GP")
+        "score": float
+
+    types: dict[str, int]
+        key = type_key (single or comma-separated types, e.g. "H2" or "H1,GP")
+        value = number of subjects required for that type_key
+
+    returns:
+        dict[type_key, list of (subject, score)] with the best matching subjects for each type_key
+
+    raises:
+        Exception if not enough subjects found for any type_key
+    """
+    # parse types dict keys into sets for easy checking
+    required_types = {
+        key: (count, set(k.strip() for k in key.split(",")))
+        for key, count in types.items()
+    }
+
+    # parse subject types similarly and store (subject, score, subject_type_set)
+    subjects = []
+    for subj, info in grades.items():
+        subj_types = set(t.strip() for t in info["type"].split(","))
+        subjects.append((subj, info["score"], subj_types))
+
+    # sort subjects by number of types ascending (more specific first), then score descending
+    subjects.sort(key=lambda x: (len(x[2]), -x[1]))
+
+    assigned = {key: [] for key in types}
+    used_subjects = set()
+
+    # for each type_key in order of required count descending (optional but safer)
+    for key, (count, type_set) in sorted(required_types.items(), key=lambda x: -x[1][0]):
+        # find candidates matching any type in the type_set and not already used
+        candidates = [
+            (subj, score, stypes)
+            for subj, score, stypes in subjects
+            if subj not in used_subjects and stypes & type_set
+        ]
+
+        if len(candidates) < count:
+            raise Exception(f"calculation requires {count} subjects of type {key} but only {len(candidates)} can be found")
+
+        # pick top 'count' candidates by score (already sorted by score)
+        selected = candidates[:count]
+
+        # record selected subjects and mark as used
+        assigned[key].extend((subj, score) for subj, score, _ in selected)
+        used_subjects.update(subj for subj, _, _ in selected)
+
+    return assigned
+
+
+def parse_type(type_str):
+    return [t.strip().upper() for t in type_str.split(",")]
+
+def categorize_subjects(grades):
+    h2 = []
+    h1 = []
+    gp = []
+    mtl = []
+    pw = []
+
+    for subj, info in grades.items():
+        types = parse_type(info["type"].upper())
+        score = info["score"]
+        # separate lists by type membership
+        if "PW" in types:
+            pw.append((subj, score))
+        elif "GP" in types:
+            gp.append((subj, score))
+        elif "MTL" in types:
+            mtl.append((subj, score))
+        elif "H2" in types:
+            h2.append((subj, score))
+        elif "H1" in types and not any([i in types for i in ["PW", "GP", "MTL"]]):
+            h1.append((subj, score))
+        else:
+            # if no recognized type, treat as h1 by default maybe
+            h1.append((subj, score))
+
+    return h2, h1, gp, mtl, pw
+
+def downgrade_h2_to_h1(h2_list, h1_list, max_h2):
+    # if more than max_h2 h2, downgrade worst h2 to h1
+    h2_list = sorted(h2_list, key=lambda x: x[1], reverse=True)
+    if len(h2_list) > max_h2:
+        downgraded = h2_list[max_h2:]
+        h2_list = h2_list[:max_h2]
+        h1_list.extend(downgraded)
+    return h2_list, h1_list
+
+def sum_points(subject_list, system, grades):
+    total = 0
+    for subj, score in subject_list:
+        # double points for h2 (handled by doubling in calculate_grade?), so pass type carefully
+        total += calculate_grade(score, system, grades[subj]["type"])[1]
+    return total
+
+def try_adding_optional_subjects(current_total, optional_subjects, current_max, system_key, grades):
+    """
+    Try adding optional subjects (e.g., mtl, downgraded h2s as h1s) to increase the RP after rebasing.
+    This function greedily adds the best scoring subjects only if they improve the average.
+    """
+    # calculate RP for each optional subject
+    graded = []
+    for subj, score in optional_subjects:
+        rp = calculate_grade(score, system_key, grades[subj]["type"])[1]
+        graded.append((rp, subj, score))
+
+    # sort by descending RP so best is considered first
+    graded.sort(reverse=True)
+
+    total = current_total
+    max_possible = current_max
+
+    for rp, subj, score in graded:
+        new_total = total + rp
+        new_max = max_possible + (90 - current_max if current_max == 70 else 10)  # always add 10 pts worth
+        old_avg = total / max_possible * 100
+        new_avg = new_total / new_max * 100
+
+        if new_avg > old_avg:
+            total = new_total
+            max_possible = new_max
+        else:
+            break  # further additions won’t help since list is sorted
+
+    return total
+
+def calculate_grade_points(grades, system):
+    # supported systems:
+    # msg-sg-l1r5
+    # msg-sg-avg-all, msg-sg-avg-l2r5
+    # uasrp-sg-70rp, uasrp-sg-90rp
+
+    # grades comes in the format of a dictionary
+    # main key is subjects
+    # each subject object has a type and value
+
+    match system.split("-"):
+        case ["msg", "sg", *etc]:
+            match etc:
+                case ["l1r5"]:
+                    best_scores = find_best_scores(grades, {"L": 1, "S": 1, "H": 1, "S,H": 3})
+                    best_scores = [
+                        calculate_grade(score, system, grades[subj]["type"])[1]
+                        for group in best_scores.values()
+                        for subj, score in group
+                    ]
+                    return f"you have {sum(best_scores)} points."
+                case ["avg", etc2]:
+                    if etc2 == "all":
+                        from collections import defaultdict
+                        grouped = defaultdict(list)
+                        for subj, info in grades.items():
+                            grouped[info["type"]].append((subj, info["score"]))
+                        best_scores = grouped
+
+                        best_scores = [
+                            calculate_grade(score, system, grades[subj]["type"])[1]
+                            for group in best_scores.values()
+                            for subj, score in group
+                        ]
+                    elif etc2 == "l2r5":
+                        best_scores = find_best_scores(grades, {"L": 2, "S": 1, "H": 1, "S,H": 3})
+                        best_scores = [
+                            calculate_grade(score, system, grades[subj]["type"])[1]
+                            for group in best_scores.values()
+                            for subj, score in group
+                        ]
+                    return f"you have a {round(sum(best_scores)/len(best_scores), 2)} MSG."
+        case ["uasrp", "sg", *etc]:
+            system_key = "-".join(["uasrp", "sg"] + list(etc))
+            h2, h1, gp, mtl, pw = categorize_subjects(grades)
+
+            if system_key == "uasrp-sg-90rp":
+                # downgrade worst h2 to h1 if >3 h2
+                h2, h1 = downgrade_h2_to_h1(h2, h1, 3)
+                # gp and pw are counted as h1
+                h1.extend(gp + pw)
+
+                # prepare candidate subjects
+                candidates = {subj: grades[subj] for subj, _ in h2 + h1}
+                weight_dict = {"H2": 3, "H1": 3}
+
+                best_scores = find_best_scores(candidates, weight_dict)
+                best_list = [item for group in best_scores.values() for item in group]
+
+                # calculate total rank points
+                total_points = sum(
+                    calculate_grade(score, system_key, grades[subj]["type"])[1]
+                    for subj, score in best_list
+                )
+
+                # try adding mtl only (pw already included above)
+                total_points = try_adding_optional_subjects(
+                    total_points, mtl, 90, system_key, grades
+                )
+
+                return f"you have {total_points} RP."
+
+            elif system_key == "uasrp-sg-70rp":
+                # downgrade worst h2 to h1 if >3 h2
+                h2, h1 = downgrade_h2_to_h1(h2, h1, 3)
+                # gp is mandatory and counted separately
+
+                candidates = {subj: grades[subj] for subj, _ in h2 + gp}
+                weight_dict = {"H2": 3, "GP": 1}
+
+                best_scores = find_best_scores(candidates, weight_dict)
+                best_list = [item for group in best_scores.values() for item in group]
+
+                total_points = sum(
+                    calculate_grade(score, system_key, grades[subj]["type"])[1]
+                    for subj, score in best_list
+                )
+
+                # try adding best of h1 (incl downgraded h2) and/or mtl greedily
+                optional_subjects = h1 + mtl
+                total_points = try_adding_optional_subjects(
+                    total_points, optional_subjects, 70, system_key, grades
+                )
+
+                return f"you have {total_points} RP."
+
+def print_help():
+    print()
+
+if len(sys.argv) == 1:
+    print_help()
+    exit()
+
+# Initialize variables
+kwargs = {}
+path = "/"
+command = sys.argv[1]
+
+# Parse command-line arguments
+for arg in sys.argv[2:]:
+    if arg.startswith("--"):
+        # Parse key-value pairs (e.g., --key=value)
+        if "=" in arg:
+            key, value = arg[2:].split("=", 1)
+            kwargs[key] = value
+        else:
+            raise Exception (f"Invalid argument: {arg}")
+    elif path == "/":
+        ppath = arg
+        pkeys = arg.split("/")
+        if check_path_exists(data, ppath) or (command == "add" and check_path_exists(data, get_parent_from_path(ppath))):
+            path = ppath
+
+# Normalize the path and extract keys
+keys = [a for a in path.split("/") if a]
+path = "/".join(keys)
+
+if not path:
+    path = "/"
+    keys = []
+
+if keys:
+    name = keys[-1]
+else:
+    name = ""
+
+if command == "add" and len(keys) == 4 and keys[-1] == "tests":
+    keys.append(kwargs["subject"] + " " + keys[2])
+    path = "/".join(keys)
+
+if not verify_path(path):
+    raise Exception("invalid path")
+
+match command:
+    case "add":
+        if not verify_path(path):
+            raise Exception("invalid path")
+        elif check_path_exists(data, path):
+            raise Exception("path already exists.")
+        elif not check_path_exists(data, get_parent_from_path(path)):
+            raise Exception("parent does not exist. please create parent object first.")
+        else:
+            object_dict = {"color": text_to_color(path)}
+            if len(keys) == 1:
+                kwargs.pop("subjects", None)  # safely remove if exists
+                kwargs.pop("seasons", None)
+                object_dict["grading"] = ""
+                object_dict["season"] = ""
+                object_dict["subjects"] = {}
+                object_dict["seasons"] = {}
+            elif keys[1] == "subjects":
+                object_dict["type"] = ""
+            elif keys[1] == "seasons" and len(keys) == 3:
+                kwargs.pop("tests", None)
+                object_dict["tests"] = {}
+            elif keys[1] == "seasons" and keys[3] == "tests":
+                if "subject" not in kwargs:
+                    raise Exception("test requires a subject")
+                for i in ["score", "full"]:
+                    if i in kwargs:
+                        kwargs[i] = float(kwargs[i])
+                object_dict["weightage"] = 1
+                object_dict["score"] = 0
+                object_dict["full"] = 100
+
+            object_dict.update(kwargs)
+            set_value_by_path(data, path, object_dict)
+
+    case "rm": 
+        if not verify_path(path):
+            raise Exception("invalid path")
+        elif not check_path_exists(data, path):
+            raise Exception("path does not exist.")
+        else:
+            set_value_by_path(data, path, None, delete=True)
+
+    case "edit":
+        newpath = path
+        for key, value in kwargs.items():
+            if key == "name":
+                newpath = "/".join(path.split("/")[:-1]) + "/" + value
+                set_value_by_path(data, newpath, copy.deepcopy(get_value_from_path(data, path)))
+                set_value_by_path(data, path, None, delete=True)
+            else:
+                set_value_by_path(data, newpath + "/" + key, value)
+
+    case "subjects":
+        subject_data = data["grades"][keys[0]]["subjects"]
+        table_rows = []
+        for subj, info in subject_data.items():
+            colored_name = color(subj, info["color"])
+            table_rows.append([colored_name, info["type"]])
+        print(tabulate(table_rows, headers=["subject", "type"], tablefmt="rounded_outline"))
+
+    case "table":
+        if not(len(keys) == 1 or (len(keys) == 3 and keys[1] == "seasons")):
+            raise Exception("path argument for command 'table' must be year or season")
+
+        year_data = data["grades"][keys[0]]
+        grading_system = year_data["grading"]
+
+        if len(keys) == 1:
+            header = ["name", "subject", "type", "season", "weightage", "score", "full", "percentage"]
+            if year_data["grading"] in SUPPORTED_GRADING_SYSTEMS:
+                header += ["grade", "points"]
+            season_data = year_data["seasons"]
+            rows = []
+            for season in season_data:
+                for exam in season_data[season]["tests"]:
+                    obj = season_data[season]["tests"][exam]
+                    subject = obj["subject"]
+                    if subject not in year_data["subjects"]:
+                        continue
+                    subject_data = year_data["subjects"][subject]
+                    marks = round(obj["score"] / obj["full"] * 100)
+                    subject_color = subject_data["color"]
+                    rows.append([exam, color(subject, fg=subject_color), subject_data["type"], obj["weightage"], obj["score"], obj["full"], marks])
+                    if "grade" in header:
+                        rows[-1] += calculate_grade(marks, year_data["grading"], subject_data["type"])
+            print(tabulate(rows, header, tablefmt="rounded_outline", numalign="left"))
+        else:
+            header = ["name", "subject", "type", "weightage", "score", "full", "percentage"]
+            if grading_system in SUPPORTED_GRADING_SYSTEMS:
+                header += ["grade", "points"]
+            season_data = year_data["seasons"][keys[2]]["tests"]
+            rows = []
+            for exam in season_data:
+                obj = season_data[exam]
+                subject = obj["subject"]
+                if subject not in year_data["subjects"]:
+                    continue
+                subject_data = year_data["subjects"][subject]
+                marks = round(obj["score"] / obj["full"] * 100)
+                subject_color = subject_data["color"]
+                rows.append([exam, color(subject, fg=subject_color), subject_data["type"], obj["weightage"], obj["score"], obj["full"], marks])
+                if "grade" in header:
+                    rows[-1] += calculate_grade(marks, year_data["grading"], subject_data["type"])
+            print(tabulate(rows, header, tablefmt="rounded_outline", numalign="left"))
+            print()
+
+        if grading_system in SUPPORTED_GRADING_SYSTEMS:
+            if len(keys) == 1:
+                grades = calculate_grades(year_data)
+            else:
+                grades = calculate_grades(year_data, keys[2])
+            print(calculate_grade_points(grades, grading_system))
+        else:
+            print(f"grading system '{grading_system}' not supported.")
+
+dump_json(data)
